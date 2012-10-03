@@ -33,9 +33,9 @@
 add_to_doc({doc, Fields}, Field) ->
     {doc, [Field|Fields]}.
 
--spec doc_id(riak_object:riak_object(), binary()) -> binary().
+-spec doc_id(obj(), binary()) -> binary().
 doc_id(O, Partition) ->
-    <<(riak_object:key(O))/binary,"_",Partition/binary>>.
+    <<(yz_kv:get_obj_key(O))/binary,"_",Partition/binary>>.
 
 doc_id(O, Partition, none) ->
     doc_id(O, Partition);
@@ -56,7 +56,7 @@ make_doc(O, {MD, V}, FPN, Partition) ->
     Vtag = get_vtag(O, MD),
     DocId = doc_id(O, Partition, Vtag),
     EntropyData = gen_ed(O, Partition),
-    Fields = make_fields({DocId, riak_key(O), FPN,
+    Fields = make_fields({DocId, yz_kv:get_obj_key(O), FPN,
                           Partition, Vtag, EntropyData}),
     ExtractedFields = extract_fields({MD, V}),
     Tags = extract_tags(MD),
@@ -70,8 +70,8 @@ make_fields({DocId, Key, FPN, Partition, none, EntropyData}) ->
      {?YZ_PN_FIELD, Partition},
      {?YZ_RK_FIELD, Key}];
 
-make_fields({DocId, Key, VC, FPN, Partition, Vtag, EntropyData}) ->
-    make_fields({DocId, Key, VC, FPN, Partition, none, EntropyData}) ++
+make_fields({DocId, Key, FPN, Partition, Vtag, EntropyData}) ->
+    make_fields({DocId, Key, FPN, Partition, none, EntropyData}) ++
       [{?YZ_VTAG_FIELD, Vtag}].
 
 %% @doc If this is a sibling, return its binary vtag
@@ -181,9 +181,6 @@ split_tag_names(TagNames) ->
 doc_ts(MD) ->
     dict:fetch(<<"X-Riak-Last-Modified">>, MD).
 
-doc_vclock(O) ->
-    riak_object:vclock(O).
-
 gen_ts() ->
     {{Year, Month, Day},
      {Hour, Min, Sec}} = calendar:now_to_universal_time(erlang:now()),
@@ -195,23 +192,8 @@ gen_ts() ->
 %%       entry.
 gen_ed(O, Partition) ->
     TS = gen_ts(),
-    RiakBucket = riak_bucket(O),
-    RiakKey = riak_key(O),
-    Hash = hash_object(O),
+    RiakBucket = yz_kv:get_obj_bucket(O),
+    RiakKey = yz_kv:get_obj_key(O),
+    %% TODO: do this in KV vnode and pass to hook
+    Hash = yz_kv:hash_object(O),
     <<TS/binary," ",Partition/binary," ",RiakBucket/binary," ",RiakKey/binary," ",Hash/binary>>.
-
-%% TODO: do this in KV vnode and pass to hook
-hash_object(O) ->
-    Vclock = riak_object:vclock(O),
-    O2 = riak_object:set_vclock(O, lists:sort(Vclock)),
-    Hash = erlang:phash2(term_to_binary(O2)),
-    term_to_binary(Hash).
-
-riak_bucket(O) ->
-    riak_object:bucket(O).
-
-riak_key(O) ->
-    riak_object:key(O).
-
-value(O) ->
-    riak_object:get_value(O).
