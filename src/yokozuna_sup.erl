@@ -53,6 +53,6 @@ init(_Args) ->
                   {yz_entropy_mgr, start_link, []},
                   permanent, 5000, worker, [yz_entropy_mgr]},
 
-    Children = [SolrProc, VMaster, Events, HashtreeSup, EntropyMgr],
+    Children = [SolrProc, Events, HashtreeSup, EntropyMgr],
 
     {ok, {{one_for_one, 5, 10}, Children}}.
