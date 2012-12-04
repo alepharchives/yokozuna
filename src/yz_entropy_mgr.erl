@@ -277,7 +277,7 @@ start_exchange(Index, Preflist, S) ->
 %% Exchanges between yz and KV are RPs
 -spec all_pairwise_exchanges(p(), ring()) -> [exchange()].
 all_pairwise_exchanges(Index, Ring) ->
-    RPs = riak_kv_vnode:responsible_preflists(Index, Ring),
+    RPs = riak_kv_util:responsible_preflists(Index, Ring),
     [{Index, {StartIdx, N}} || {StartIdx, N} <- RPs].
 
 -spec all_exchanges(ring(), trees()) -> [exchange()].

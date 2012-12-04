@@ -84,7 +84,7 @@ get_lock(Tree, Type, Pid) ->
 
 init([Index]) ->
     Path = filename:join(?YZ_HASHTREES_BASE_PATH, integer_to_list(Index)),
-    RPs = riak_kv_vnode:responsible_preflists(Index),
+    RPs = riak_kv_util:responsible_preflists(Index),
     S = #state{index=Index,
                trees=orddict:new(),
                built=false,
@@ -303,7 +303,7 @@ do_delete(Id, Key, State=#state{trees=Trees}) ->
     end.
 
 handle_unexpected_key(Id, Key, State=#state{index=Partition}) ->
-    RP = riak_kv_vnode:responsible_preflists(Partition),
+    RP = riak_kv_util:responsible_preflists(Partition),
     case lists:member(Id, RP) of
         false ->
             lager:warning("Object ~p encountered during fold over partition "
@@ -364,7 +364,7 @@ clear_tree(S=#state{index=Index, trees=Trees}) ->
     lager:info("Clearing tree ~p", [S#state.index]),
     {_,Tree0} = hd(Trees),
     hashtree:destroy(Tree0),
-    IndexN = riak_kv_vnode:responsible_preflists(Index),
+    IndexN = riak_kv_util:responsible_preflists(Index),
     S2 = init_trees(IndexN, S#state{trees=orddict:new()}),
     S2#state{built=false}.
 

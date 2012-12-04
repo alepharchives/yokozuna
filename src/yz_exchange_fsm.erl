@@ -67,16 +67,16 @@ prepare_exchange(start_exchange, S) ->
             YZTree = yz_entropy_mgr:get_tree(Index),
             case yz_index_hashtree:get_lock(YZTree, fsm) of
                 ok ->
-                    case entropy_manager:get_lock(yokozuna_exchange) of
+                    case riak_kv_entropy_manager:get_lock(yokozuna_exchange) of
                         max_concurrency ->
                             maybe_reply(max_concurrency, S),
                             {stop, normal, S};
                         ok ->
-                            KVTree = entropy_manager:get_tree(Index),
+                            KVTree = riak_kv_entropy_manager:get_tree(Index),
                             S2 = S#state{yz_tree=YZTree, kv_tree=KVTree},
                             monitor(process, YZTree),
                             monitor(process, KVTree),
-                            case index_hashtree:get_lock(KVTree, yz_fsm) of
+                            case riak_kv_index_hashtree:get_lock(KVTree, yz_fsm) of
                                 ok ->
                                     update_trees(start_exchange, S2);
                                 _ ->
@@ -99,7 +99,7 @@ update_trees(start_exchange, S=#state{yz_tree=YZTree,
                                       index_n=IndexN}) ->
 
     update_request(yz_index_hashtree, YZTree, Index, IndexN),
-    update_request(index_hashtree, KVTree, Index, IndexN),
+    update_request(riak_kv_index_hashtree, KVTree, Index, IndexN),
     next_state_with_timeout(update_trees, S);
 
 update_trees(timeout, S) ->
@@ -142,7 +142,7 @@ key_exchange(timeout, S=#state{index=Index,
                                    end, KeyDiff),
                      Acc
              end,
-    index_hashtree:compare(IndexN, Remote, AccFun, YZTree),
+    riak_kv_index_hashtree:compare(IndexN, Remote, AccFun, YZTree),
 
     lager:info("Finished key exchange for partition ~p preflist ~p",
                [Index, IndexN]),
@@ -168,10 +168,10 @@ fake_kv_vnode_state(Partition) ->
     {state,Partition,fake,fake,fake,fake,fake,fake,fake,fake,fake,fake,fake}.
 
 exchange_bucket_kv(Tree, IndexN, Level, Bucket) ->
-    index_hashtree:exchange_bucket(IndexN, Level, Bucket, Tree).
+    riak_kv_index_hashtree:exchange_bucket(IndexN, Level, Bucket, Tree).
 
 exchange_segment_kv(Tree, IndexN, Segment) ->
-    index_hashtree:exchange_segment(IndexN, Segment, Tree).
+    riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
 
 handle_event(_Event, _StateName, State) ->
     {stop, badmsg, State}.
