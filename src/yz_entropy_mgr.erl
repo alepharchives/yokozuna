@@ -33,6 +33,9 @@ get_lock(Type, Pid) ->
 get_tree(Index) ->
     gen_server:call(?MODULE, {get_tree, Index}, infinity).
 
+exchange_status(Index, IndexN, Status) ->
+    gen_server:cast(?MODULE, {exchange_status, self(), Index, IndexN, Status}).
+
 %% @doc Put the entropy manager in automatic mode.
 -spec automatic_mode() -> ok.
 automatic_mode() ->
@@ -73,9 +76,9 @@ handle_call({get_tree, Index}, _, S) ->
     end;
 
 handle_call({manual_exchange, Index, Partition}, _From, S) ->
-    case start_exchange(Index, Partition, S) of
+    case start_exchange(Index, Partition, yz_misc:get_ring(transformed), S) of
         {ok, S2} -> {reply, ok, S2};
-        {error, Reason, S2} -> {reply, {error, Reason}, S2}
+        {Reason, S2} -> {reply, {error, Reason}, S2}
     end;
 
 handle_call({set_mode, Mode}, _From, S) ->
@@ -261,17 +264,25 @@ do_exchange_status(_Pid, Index, {StartIdx, N}, Reply, S) ->
             requeue_exchange(Index, {StartIdx, N}, S)
     end.
 
--spec start_exchange(p(), {p(),n()}, state()) ->
-                            {ok, state()} | {error, any(), state()}.
-start_exchange(Index, Preflist, S) ->
-    case yz_exchange_fsm:start(Index, Preflist) of
-        {ok, FsmPid} ->
-            yz_exchange_fsm:start_exchange(FsmPid, self()),
-            Ref = monitor(process, FsmPid),
-            E = S#state.exchanges,
-            {ok, S#state{exchanges=[{Index,Ref}|E]}};
-        {error, Reason} ->
-            {error, Reason, S}
+-spec start_exchange(p(), {p(),n()}, ring(), state()) -> {any(), state()}.
+start_exchange(Index, Preflist, Ring, S) ->
+    case riak_core_ring:index_owner(Ring, Index) == node() of
+        false ->
+            {not_responsible, S};
+        true ->
+            %% TODO: check for not_registered
+            YZTree = get_tree(Index),
+            %% TODO: use async version in case vnode is backed up
+            {ok, KVTree} = riak_kv_vnode:hashtree_pid(Index),
+            case yz_exchange_fsm:start(Index, Preflist, YZTree,
+                                       KVTree, self()) of
+                {ok, FsmPid} ->
+                    Ref = monitor(process, FsmPid),
+                    E = S#state.exchanges,
+                    {ok, S#state{exchanges=[{Index,Ref}|E]}};
+                {error, Reason} ->
+                    {Reason, S}
+            end
     end.
 
 %% Exchanges between yz and KV are RPs
@@ -310,14 +321,14 @@ maybe_exchange(S) ->
         {none, S2} ->
             S2;
         {NextExchange, S2} ->
-            {Index, {StartIdx, N}} = NextExchange,
+            {Index, IndexN} = NextExchange,
             case already_exchanging(Index, S) of
                 true ->
-                    requeue_exchange(Index, {StartIdx, N}, S2);
+                    requeue_exchange(Index, IndexN, S2);
                 false ->
-                    case start_exchange(Index, {StartIdx, N}, S2) of
+                    case start_exchange(Index, IndexN, Ring, S2) of
                         {ok, S3} -> S3;
-                        {error, _, S3} -> S3
+                        {_, S3} -> S3
                     end
             end
     end.

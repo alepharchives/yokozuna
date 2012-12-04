@@ -14,22 +14,16 @@
                 built :: integer(),
                 from :: any()}).
 
-%% Per state transition timeout used by certain transitions
--define(DEFAULT_ACTION_TIMEOUT, 20000).
-
 %%%===================================================================
 %%% API
 %%%===================================================================
 
 %% @doc Initialize the exchange FSM to exchange between Yokozuna and
 %%      KV for the `Preflist' replicas on `Index'.
--spec start(p(), {p(),n()}) -> {ok, pid()} | {error, any()}.
-start(Index, Preflist) ->
-    gen_fsm:start(?MODULE, [Index, Preflist], []).
-
-%% @doc Start the exchange on `FSM' and send the result to `Pid'.
-start_exchange(FSM, Pid) ->
-    gen_fsm:send_event(FSM, {start_exchange, Pid}).
+-spec start(p(), {p(),n()}, tree(), tree(), pid()) ->
+                   {ok, pid()} | {error, any()}.
+start(Index, Preflist, YZTree, KVTree, Manager) ->
+    gen_fsm:start(?MODULE, [Index, Preflist, YZTree, KVTree, Manager], []).
 
 %%%===================================================================
 %%% gen_fsm callbacks
@@ -44,50 +38,49 @@ start_exchange(FSM, Pid) ->
 %% step4: aquire lock from yz tree and kv tree
 %%
 %% step5: start exchange of Preflist between yz and kv tree
-init([Index, Preflist]) ->
+init([Index, Preflist, YZTree, KVTree, Manager]) ->
+    monitor(process, Manager),
+    monitor(process, YZTree),
+    monitor(process, KVTree),
+
     S = #state{index=Index,
                index_n=Preflist,
+               yz_tree=YZTree,
+               kv_tree=KVTree,
                built=0},
+    gen_fsm:send_event(self(), start_exchange),
+    lager:debug("Starting exchange between KV and Yokozuna: ~p", [Index]),
     {ok, prepare_exchange, S}.
 
-prepare_exchange({start_exchange, From}, S) ->
-    monitor(process, From),
-    prepare_exchange(start_exchange, S#state{from=From});
-
 prepare_exchange(start_exchange, S) ->
-    %% Get locks and pids of yokozuna and KV trees
-    Index = S#state.index,
+    YZTree = S#state.yz_tree,
+    KVTree = S#state.kv_tree,
+
     case yz_entropy_mgr:get_lock(exchange) of
-        max_concurrency ->
-            maybe_reply(max_concurrency, S),
-            %% TODO: russell said normal is not valid stop reason for FSM
-            {stop, normal, S};
         ok ->
-            %% TODO: check for not_registered
-            YZTree = yz_entropy_mgr:get_tree(Index),
-            case yz_index_hashtree:get_lock(YZTree, fsm) of
+            case yz_index_hashtree:get_lock(YZTree, ?MODULE) of
                 ok ->
-                    case riak_kv_entropy_manager:get_lock(yokozuna_exchange) of
-                        max_concurrency ->
-                            maybe_reply(max_concurrency, S),
-                            {stop, normal, S};
+                    case riak_kv_entropy_manager:get_lock(?MODULE) of
                         ok ->
-                            KVTree = riak_kv_entropy_manager:get_tree(Index),
-                            S2 = S#state{yz_tree=YZTree, kv_tree=KVTree},
-                            monitor(process, YZTree),
-                            monitor(process, KVTree),
-                            case riak_kv_index_hashtree:get_lock(KVTree, yz_fsm) of
+                            case riak_kv_index_hashtree:get_lock(KVTree,
+                                                                 ?MODULE) of
                                 ok ->
-                                    update_trees(start_exchange, S2);
+                                    update_trees(start_exchange, S);
                                 _ ->
-                                    maybe_reply(already_locked, S),
+                                    send_exchange_status(already_locked, S),
                                     {stop, normal, S}
-                            end
+                            end;
+                        Error ->
+                            send_exchange_status(Error, S),
+                            {stop, normal, S}
                     end;
                 _ ->
-                    maybe_reply(already_locked, S),
+                    send_exchange_status(already_locked, S),
                     {stop, normal, S}
-            end
+            end;
+        Error ->
+            send_exchange_status(Error, S),
+            {stop, normal, S}
     end;
 
 prepare_exchange(timeout, S) ->
@@ -100,32 +93,29 @@ update_trees(start_exchange, S=#state{yz_tree=YZTree,
 
     update_request(yz_index_hashtree, YZTree, Index, IndexN),
     update_request(riak_kv_index_hashtree, KVTree, Index, IndexN),
-    next_state_with_timeout(update_trees, S);
-
-update_trees(timeout, S) ->
-    do_timeout(S);
+    {next_state, update_trees, S};
 
 update_trees({not_responsible, Index, IndexN}, S) ->
-    lager:info("Index ~p does not cover preflist ~p", [Index, IndexN]),
-    maybe_reply({not_responsible, Index, IndexN}, S),
+    lager:debug("Index ~p does not cover preflist ~p", [Index, IndexN]),
+    send_exchange_status({not_responsible, Index, IndexN}, S),
     {stop, normal, S};
 
 update_trees({tree_built, _, _}, S) ->
     Built = S#state.built + 1,
     case Built of
         2 ->
-            lager:info("Moving to key exchange"),
+            lager:debug("Moving to key exchange"),
             {next_state, key_exchange, S, 0};
         _ ->
-            next_state_with_timeout(update_trees, S#state{built=Built})
+            {next_state, update_trees, S#state{built=Built}}
     end.
 
 key_exchange(timeout, S=#state{index=Index,
                                yz_tree=YZTree,
                                kv_tree=KVTree,
                                index_n=IndexN}) ->
-    lager:info("Starting key exchange for partition ~p preflist ~p",
-               [Index, IndexN]),
+    lager:debug("Starting key exchange for partition ~p preflist ~p",
+                [Index, IndexN]),
 
     Remote = fun(get_bucket, {L, B}) ->
                      exchange_bucket_kv(KVTree, IndexN, L, B);
@@ -133,31 +123,37 @@ key_exchange(timeout, S=#state{index=Index,
                      exchange_segment_kv(KVTree, IndexN, Segment)
              end,
 
-    %% TODO: Do we want this to be sync? Do we want FSM to be able to timeout?
-    %%       Perhaps this should be sync but we have timeout tick?
     {ok, RC} = riak:local_client(),
     AccFun = fun(KeyDiff, Acc) ->
-                     lists:foreach(fun(Diff) ->
-                                           read_repair_keydiff(RC, Diff)
-                                   end, KeyDiff),
-                     Acc
+                     lists:foldl(fun(Diff, Acc2) ->
+                                         read_repair_keydiff(RC, Diff),
+                                         case Acc2 of
+                                             [] ->
+                                                 [1];
+                                             [Count] ->
+                                                 [Count+1]
+                                         end
+                                 end, Acc, KeyDiff)
              end,
-    riak_kv_index_hashtree:compare(IndexN, Remote, AccFun, YZTree),
 
-    lager:info("Finished key exchange for partition ~p preflist ~p",
-               [Index, IndexN]),
-
+    case riak_kv_index_hashtree:compare(IndexN, Remote, AccFun, YZTree) of
+        [] ->
+            ok;
+        [Count] ->
+            lager:info("Repaired ~b keys during active anti-entropy exchange "
+                       "of ~p", [Count, IndexN])
+    end,
     {stop, normal, S}.
 
 read_repair_keydiff(RC, {_, KeyBin}) ->
     BKey = {Bucket, Key} = binary_to_term(KeyBin),
-    lager:info("Anti-entropy forced read repair and re-index: ~p/~p", [Bucket, Key]),
+    lager:debug("Anti-entropy forced read repair and re-index: ~p/~p", [Bucket, Key]),
     {ok, Obj} = RC:get(Bucket, Key),
     Ring = yz_misc:get_ring(transformed),
     BucketProps = riak_core_bucket:get_bucket(Bucket, Ring),
     Idx = riak_core_util:chash_key(BKey),
     N = proplists:get_value(n_val,BucketProps),
-    Preflist = riak_core_ring:preflist(Idx, N, Ring),
+    Preflist = lists:sublist(riak_core_ring:preflist(Idx, Ring), N),
     lists:foreach(fun({Partition, Node}) ->
                           FakeState = fake_kv_vnode_state(Partition),
                           rpc:call(Node, yz_kv, index, [Obj, anti_entropy, FakeState])
@@ -173,18 +169,18 @@ exchange_bucket_kv(Tree, IndexN, Level, Bucket) ->
 exchange_segment_kv(Tree, IndexN, Segment) ->
     riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
 
-handle_event(_Event, _StateName, State) ->
-    {stop, badmsg, State}.
+handle_event(_Event, StateName, State) ->
+    {next_state, StateName, State}.
 
-handle_sync_event(_Event, _From, _StateName, State) ->
-    {stop, badmsg, State}.
+handle_sync_event(_Event, _From, StateName, State) ->
+    {reply, ok, StateName, State}.
 
 handle_info({'DOWN', _, _, _, _}, _StateName, State) ->
     %% Either the entropy manager, local hashtree, or remote hashtree has
     %% exited. Stop exchange.
     {stop, normal, State};
-handle_info(_Info, _StateName, State) ->
-    {stop, badmsg, State}.
+handle_info(_Info, StateName, State) ->
+    {next_state, StateName, State}.
 
 terminate(_Reason, _StateName, _State) ->
     ok.
@@ -208,36 +204,18 @@ update_request(Module, Tree, Index, IndexN) ->
 
 as_event(F) ->
     Self = self(),
-    spawn(fun() ->
-                  Result = F(),
-                  gen_fsm:send_event(Self, Result)
-          end),
+    spawn_link(fun() ->
+                       Result = F(),
+                       gen_fsm:send_event(Self, Result)
+               end),
     ok.
 
-%% TODO: where is this timeout handled, or is it just ignored?
 do_timeout(S=#state{index=Index, index_n=Preflist}) ->
     lager:info("Timeout during exchange of partition ~p for preflist ~p ",
                [Index, Preflist]),
-    maybe_reply({timeout, Index}, S),
+    send_exchange_status({timeout, Index, Preflist}, S),
     {stop, normal, S}.
 
-maybe_reply(_, S=#state{from=undefined}) ->
-    ok,
-    S;
-
-maybe_reply(Reply, S=#state{from=Pid,
-                                index=Index,
-                                index_n=IndexN}) when is_pid(Pid) ->
-    %% TODO: make this yz_entropy_mgr:exchange_status
-    gen_server:cast(Pid, {exchange_status, self(), Index, IndexN, Reply}),
-    S#state{from=undefined};
-
-maybe_reply(Reply, S=#state{from=From}) ->
-    %% TODO: who is this reply going to?
-    gen_fsm:reply(From, Reply),
-    S#state{from=undefined}.
-
-next_state_with_timeout(StateName, State) ->
-    next_state_with_timeout(StateName, State, ?DEFAULT_ACTION_TIMEOUT).
-next_state_with_timeout(StateName, State, Timeout) ->
-    {next_state, StateName, State, Timeout}.
+send_exchange_status(Status, #state{index=Index,
+                                    index_n=IndexN}) ->
+    yz_entropy_mgr:exchange_status(Index, IndexN, Status).
