@@ -78,6 +78,14 @@ get_lock(Tree, Type, Pid) ->
     put(calling, ?LINE),
     gen_server:call(Tree, {get_lock, Type, Pid}, infinity).
 
+
+%% @doc Poke the specified `Tree' to ensure the it is built/rebuilt as
+%%      needed. This is periodically called by the {@link
+%%      yz_entropy_manager}.
+-spec poke(tree()) -> ok.
+poke(Tree) ->
+    gen_server:cast(Tree, poke).
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
@@ -186,7 +194,7 @@ handle_cast(build, S) ->
     {noreply, S2};
 
 handle_cast(build_failed, State) ->
-    gen_server:cast(entropy_manager, {requeue_poke, State#state.index}),
+    yz_entropy_manager:requeue_poke(State#state.index),
     State2 = State#state{built=false},
     {noreply, State2};
 handle_cast(build_finished, State) ->
