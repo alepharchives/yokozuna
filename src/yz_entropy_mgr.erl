@@ -1,3 +1,23 @@
+%% -------------------------------------------------------------------
+%%
+%% Copyright (c) 2012 Basho Technologies, Inc.  All Rights Reserved.
+%%
+%% This file is provided to you under the Apache License,
+%% Version 2.0 (the "License"); you may not use this file
+%% except in compliance with the License.  You may obtain
+%% a copy of the License at
+%%
+%%   http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing,
+%% software distributed under the License is distributed on an
+%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+%% KIND, either express or implied.  See the License for the
+%% specific language governing permissions and limitations
+%% under the License.
+%%
+%% -------------------------------------------------------------------
+
 -module(yz_entropy_mgr).
 -compile(export_all).
 -behaviour(gen_server).
@@ -11,9 +31,13 @@
                 trees :: trees(),
                 tree_queue :: trees(),
                 locks :: [{pid(),reference()}],
+                build_tokens = 0 :: non_neg_integer(),
                 exchange_queue :: [exchange()],
-                exchanges :: [{p(),reference()}]}).
+                exchanges :: [{p(),reference(), pid()}]}).
 -type state() :: #state{}.
+
+-define(DEFAULT_CONCURRENCY, 2).
+-define(DEFAULT_BUILD_LIMIT, {1, 3600000}). %% Once per hour
 
 %%%===================================================================
 %%% API
@@ -22,33 +46,71 @@
 start_link() ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, [], []).
 
+%% @doc Acquire an exchange concurrency lock if available, and associate
+%%      the lock with the calling process.
+-spec get_lock(term()) -> ok | max_concurrency.
 get_lock(Type) ->
     get_lock(Type, self()).
 
+-spec get_lock(term(), pid()) -> ok | max_concurrency.
 get_lock(Type, Pid) ->
     gen_server:call(?MODULE, {get_lock, Type, Pid}, infinity).
 
-%% @doc Get the tree registered for `Index'.
--spec get_tree(p()) -> tree() | not_registered.
-get_tree(Index) ->
-    gen_server:call(?MODULE, {get_tree, Index}, infinity).
+%% @doc Used by {@link yz_index_hashtree} to requeue a poke on build
+%%      failure.
+-spec requeue_poke(p()) -> ok.
+requeue_poke(Index) ->
+    gen_server:cast(?MODULE, {requeue_poke, Index}).
 
+%% @doc Used by {@link yz_exchange_fsm} to inform the entropy manager
+%%      about the status of an exchange (ie. completed without issue,
+%%      failed, etc)
+-spec exchange_status(p(), {p(), n()}, term()) -> ok.
 exchange_status(Index, IndexN, Status) ->
     gen_server:cast(?MODULE, {exchange_status, self(), Index, IndexN, Status}).
 
-%% @doc Put the entropy manager in automatic mode.
--spec automatic_mode() -> ok.
-automatic_mode() ->
-    gen_server:call(?MODULE, {set_mode, automatic}, infinity).
+%% @doc Returns true of AAE is enabled, false otherwise.
+-spec enabled() -> boolean().
+enabled() ->
+    riak_kv_entropy_manager:enabled().
 
-%% @doc Put the entropy manager in manual mode.  The tick will still
-%%      occur but no exchanges will be performed.
--spec manual_mode() -> ok.
-manual_mode() ->
-    gen_server:call(?MODULE, {set_mode, manual}, infinity).
+%% @doc Set AAE to either `automatic' or `manual' mode. In automatic mode, the
+%%      entropy manager triggers all necessary hashtree exchanges. In manual
+%%      mode, exchanges must be triggered using {@link manual_exchange/1}.
+%%      Regardless of exchange mode, the entropy manager will always ensure
+%%      local hashtrees are built and rebuilt as necessary.
+-spec set_mode(automatic | manual) -> ok.
+set_mode(Mode=automatic) ->
+    ok = gen_server:call(?MODULE, {set_mode, Mode}, infinity);
+set_mode(Mode=manual) ->
+    ok = gen_server:call(?MODULE, {set_mode, Mode}, infinity).
 
-manual_exchange(Index, Preflist) ->
-    gen_server:call(?MODULE, {manual_exchange, Index, Preflist}, infinity).
+%% NOTE: Yokozuna only runs when KV AAE runs, but this API is needed
+%% so that the Yokozuna hashtrees may be stopped.
+disable() ->
+    gen_server:call(?MODULE, disable, infinity).
+
+%% @doc Manually trigger hashtree exchanges.
+%%
+%%      -- If a partition is provided, trigger exchanges between Yokozuna
+%%         and KV for all preflists stored by the partition.
+%%
+%%      -- If both a partition and preflist are provided, trigger
+%%         exchange between Yokozuna and KV for that index/preflist.
+-spec manual_exchange(p() | {p(), {p(), n()}}) -> ok.
+manual_exchange(Exchange) ->
+    gen_server:call(?MODULE, {manual_exchange, Exchange}, infinity).
+
+%% @doc Stop the exchange currently executing for `Index', if there
+%%      is one.
+-spec cancel_exchange(p()) -> ok | undefined.
+cancel_exchange(Index) ->
+    gen_server:call(?MODULE, {cancel_exchange, Index}, infinity).
+
+%% @doc Stop all currently executing exchanges.
+-spec cancel_exchanges() -> [p()].
+cancel_exchanges() ->
+    gen_server:call(?MODULE, cancel_exchanges, infinity).
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -57,29 +119,48 @@ manual_exchange(Index, Preflist) ->
 init([]) ->
     Trees = get_trees_from_sup(),
     schedule_tick(),
-    S = #state{mode=automatic,
+    {_, Opts} = settings(),
+    Mode = case proplists:is_defined(manual, Opts) of
+               true -> manual;
+               false -> automatic
+           end,
+    S = #state{mode=Mode,
                trees=Trees,
                tree_queue=[],
                locks=[],
                exchanges=[],
                exchange_queue=[]},
-    {ok, S}.
+    S2 = reset_build_tokens(S),
+    schedule_reset_build_tokens(),
+    {ok, S2}.
 
 handle_call({get_lock, Type, Pid}, _From, S) ->
     {Reply, S2} = do_get_lock(Type, Pid, S),
     {reply, Reply, S2};
 
-handle_call({get_tree, Index}, _, S) ->
-    case orddict:find(Index, S#state.trees) of
-        {ok, Tree} -> {reply, Tree, S};
-        error -> {reply, not_registered, S}
+handle_call({manual_exchange, Exchange}, _From, S) ->
+    S2 = enqueue_exchange(Exchange, S),
+    {reply, ok, S2};
+
+handle_call({cancel_exchange, Index}, _From, S) ->
+    case lists:keyfind(Index, 1, S#state.exchanges) of
+        false ->
+            {reply, undefined, S};
+        {Index, _Ref, Pid} ->
+            exit(Pid, kill),
+            {reply, ok, S}
     end;
 
-handle_call({manual_exchange, Index, Partition}, _From, S) ->
-    case start_exchange(Index, Partition, yz_misc:get_ring(transformed), S) of
-        {ok, S2} -> {reply, ok, S2};
-        {Reason, S2} -> {reply, {error, Reason}, S2}
-    end;
+handle_call(cancel_exchanges, _From, S=#state{exchanges=Exchanges}) ->
+    Indices = [begin
+                   exit(Pid, kill),
+                   Index
+               end || {Index, _Ref, Pid} <- Exchanges],
+    {reply, Indices, S};
+
+handle_call(disable, _From, S) ->
+    [yz_index_hashtree:stop(T) || {_,T} <- S#state.trees],
+    {reply, ok, S};
 
 handle_call({set_mode, Mode}, _From, S) ->
     S2 = S#state{mode=Mode},
@@ -93,28 +174,27 @@ handle_cast({requeue_poke, Index}, S) ->
     S2 = requeue_poke(Index, S),
     {noreply, S2};
 
-handle_cast({exchange_status, Pid, Index, {StartIdx, N}, Reply}, S) ->
-    S2 = do_exchange_status(Pid, Index, {StartIdx, N}, Reply, S),
+handle_cast({exchange_status, Pid, Index, {StartIdx, N}, Status}, S) ->
+    S2 = do_exchange_status(Pid, Index, {StartIdx, N}, Status, S),
     {noreply, S2};
 
 handle_cast(_Msg, S) ->
+    lager:warning("Unexpected cast: ~p", [_Msg]),
     {noreply, S}.
 
 handle_info(tick, S) ->
-    Mode = S#state.mode,
-    S2 = reload_hashtrees(S),
-    S3 = tick(S2, Mode),
-    schedule_tick(),
-    {noreply, S3};
+    S2 = maybe_tick(S),
+    {noreply, S2};
 
-handle_info({'DOWN', Ref, _, Obj, _}, S) ->
+handle_info({'DOWN', Ref, _, Obj, Status}, S) ->
     %% NOTE: The down msg could be for exchange FSM or tree
     S2 = maybe_release_lock(Ref, S),
-    S3 = maybe_clear_exchange(Ref, S2),
+    S3 = maybe_clear_exchange(Ref, Status, S2),
     S4 = maybe_clear_registered_tree(Obj, S3),
     {noreply, S4};
 
-handle_info(_Info, S) ->
+handle_info(_Msg, S) ->
+    lager:warning("Unexpected msg: ~p", [_Msg]),
     {noreply, S}.
 
 terminate(_Reason, _S) ->
@@ -126,6 +206,37 @@ code_change(_OldVsn, S, _Extra) ->
 %%%===================================================================
 %%% Internal functions
 %%%===================================================================
+
+schedule_reset_build_tokens() ->
+    {_, Reset} = app_helper:get_env(riak_kv, anti_entropy_build_limit,
+                                    ?DEFAULT_BUILD_LIMIT),
+    erlang:send_after(Reset, self(), reset_build_tokens).
+
+reset_build_tokens(S) ->
+    {Tokens, _} = app_helper:get_env(riak_kv, anti_entropy_build_limit,
+                                     ?DEFAULT_BUILD_LIMIT),
+    S#state{build_tokens=Tokens}.
+
+-spec settings() -> {boolean(), proplists:proplist()}.
+settings() ->
+    case app_helper:get_env(riak_kv, anti_entropy, {off, []}) of
+        {on, Opts} ->
+            {true, Opts};
+        {off, Opts} ->
+            {false, Opts};
+        X ->
+            lager:warning("Invalid setting for riak_kv/anti_entropy: ~p", [X]),
+            application:set_env(riak_kv, anti_entropy, {off, []}),
+            {false, []}
+    end.
+
+%% @private
+-spec get_tree(p(), state()) -> {ok, tree()} | not_registered.
+get_tree(Index, S) ->
+    case orddict:find(Index, S#state.trees) of
+        {ok, Tree} -> {ok, Tree};
+        error -> not_registered
+    end.
 
 %% @private
 %%
@@ -147,9 +258,11 @@ get_index(Tree, Trees) ->
         Index -> [{Index,Tree}|Trees]
     end.
 
--spec reload_hashtrees(state()) -> state().
-reload_hashtrees(S=#state{trees=Trees}) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+reload_hashtrees(Ring, S) ->
+    reload_hashtrees(enabled(), Ring, S).
+
+-spec reload_hashtrees(boolean(), ring(), state()) -> state().
+reload_hashtrees(true, Ring, S=#state{mode=Mode, trees=Trees}) ->
     Indices = riak_core_ring:my_indices(Ring),
     Existing = orddict:from_list(Trees),
 
@@ -165,10 +278,15 @@ reload_hashtrees(S=#state{trees=Trees}) ->
 
     S2 = S#state{trees=Trees3},
     S3 = lists:foldl(fun({Idx,Pid}, SAcc) ->
-                                 monitor(process, Pid),
-                                 add_index_exchanges(Idx, SAcc)
-                         end, S2, L),
-    S3.
+                             monitor(process, Pid),
+                             case Mode of
+                                 manual -> SAcc;
+                                 automatic -> enqueue_exchange(Idx, SAcc)
+                             end
+                     end, S2, L),
+    S3;
+reload_hashtrees(false, _, S) ->
+    S.
 
 %% @private
 %%
@@ -176,37 +294,55 @@ reload_hashtrees(S=#state{trees=Trees}) ->
 -spec remove_trees(trees(), [p()]) -> trees().
 remove_trees(Trees, ToRemove) ->
     F = fun(Idx,TreesAcc) -> orddict:erase(Idx, TreesAcc) end,
+    %% TODO: finish this
     [yz_index_hashtree:remove(Idx) || Idx <- ToRemove],
     lists:foldl(F, Trees, ToRemove).
 
-%% NOTES: Exchange FSM grabs the lock and thus is monitored
--spec do_get_lock(atom(), pid(), state()) ->
-                         {max_concurrency, state()} | {ok, state()}.
-do_get_lock(_Type, Pid, S=#state{locks=Locks}) ->
-    case length(Locks) >= ?YZ_HASH_EXCHANGE_CONCURRENCY of
+-spec do_get_lock(term(), pid(), state()) ->
+                         {ok | max_concurrency | build_limit_reached, state()}.
+do_get_lock(Type, Pid, S=#state{locks=Locks}) ->
+    Concurrency = app_helper:get_env(riak_kv,
+                                     anti_entropy_concurrency,
+                                     ?DEFAULT_CONCURRENCY),
+    case length(Locks) >= Concurrency of
         true ->
             {max_concurrency, S};
         false ->
-            Ref = monitor(process, Pid),
-            S2 = S#state{locks=[{Pid,Ref}|Locks]},
-            {ok, S2}
+            case check_lock_type(Type, S) of
+                {ok, S2} ->
+                    Ref = monitor(process, Pid),
+                    S3 = S2#state{locks=[{Pid,Ref}|Locks]},
+                    {ok, S3};
+                Error ->
+                    {Error, S}
+            end
     end.
+
+
+-spec check_lock_type(term(), state()) -> {ok, state()} | build_limit_reached.
+check_lock_type(build, S=#state{build_tokens=Tokens}) ->
+    if Tokens > 0 ->
+            {ok, S#state{build_tokens=Tokens-1}};
+       true ->
+            build_limit_reached
+    end;
+check_lock_type(_Type, S) ->
+    {ok, S}.
 
 -spec maybe_release_lock(reference(), state()) -> state().
 maybe_release_lock(Ref, S) ->
     Locks = lists:keydelete(Ref, 2, S#state.locks),
     S#state{locks=Locks}.
 
--spec maybe_clear_exchange(reference(), state()) -> state().
-maybe_clear_exchange(Ref, S) ->
-    case lists:keyfind(Ref, 2, S#state.exchanges) of
+-spec maybe_clear_exchange(reference(), term(), state()) -> state().
+maybe_clear_exchange(Ref, Status, S) ->
+    case lists:keytake(Ref, 2, S#state.exchanges) of
         false ->
-            ok;
-        {Idx,Ref} ->
-            lager:info("Untracking exchange: ~p", [Idx])
-    end,
-    Exchanges = lists:keydelete(Ref, 2, S#state.exchanges),
-    S#state{exchanges=Exchanges}.
+            S;
+        {value, {Idx,Ref,_Pid}, Exchanges} ->
+            lager:debug("Untracking exchange: ~p :: ~p", [Idx, Status]),
+            S#state{exchanges=Exchanges}
+    end.
 
 -spec maybe_clear_registered_tree(pid(), state()) -> state().
 maybe_clear_registered_tree(Pid, S) when is_pid(Pid) ->
@@ -230,14 +366,30 @@ next_tree(S=#state{tree_queue=Queue, trees=Trees}) ->
 schedule_tick() ->
     erlang:send_after(?YZ_ENTROPY_TICK, ?MODULE, tick).
 
--spec tick(state(), exchange_mode()) -> state().
-tick(S, automatic) ->
-    S2 = lists:foldl(fun(_,SAcc) ->
-                                 maybe_poke_tree(SAcc)
-                         end, S, lists:seq(1,10)),
-    maybe_exchange(S2);
-tick(S, manual) ->
-    S.
+maybe_tick(S) ->
+    case enabled() of
+        true ->
+            case riak_core_capability:get({riak_kv, anti_entropy}, disabled) of
+                disabled -> S2 = S;
+                enabled_v1 -> S2 = tick(S)
+            end;
+        false ->
+            %% Ensure we do not have any running index_hashtrees, which can
+            %% happen when disabling anti-entropy on a live system.
+            [yz_index_hashtree:stop(T) || {_,T} <- S#state.trees],
+            S2 = S
+    end,
+    schedule_tick(),
+    S2.
+
+-spec tick(state()) -> state().
+tick(S) ->
+    Ring = yz_misc:get_ring(transformed),
+    S2 = reload_hashtrees(Ring, S),
+    S3 = lists:foldl(fun(_,SAcc) ->
+                             maybe_poke_tree(SAcc)
+                     end, S2, lists:seq(1,10)),
+    maybe_exchange(Ring, S3).
 
 -spec maybe_poke_tree(state()) -> state().
 maybe_poke_tree(S) ->
@@ -245,8 +397,7 @@ maybe_poke_tree(S) ->
         {none, S2} ->
             S2;
         {Tree, S2} ->
-            %% TODO: replace with yz_index_hashtree:poke/1
-            gen_server:cast(Tree, poke),
+            yz_index_hashtree:poke(Tree),
             S2
     end.
 
@@ -255,12 +406,13 @@ maybe_poke_tree(S) ->
 %%%===================================================================
 
 -spec do_exchange_status(pid(), p(), {p(), n()}, any(), state()) -> state().
-do_exchange_status(_Pid, Index, {StartIdx, N}, Reply, S) ->
-    case Reply of
+do_exchange_status(_Pid, Index, {StartIdx, N}, Status, S) ->
+    case Status of
         ok -> S;
         _ ->
-            lager:info("Requeue exhcange for partition ~p of preflist ~p for reason ~p",
-                       [Index, {StartIdx, N}, Reply]),
+            lager:debug("Requeue exhcange for partition ~p of preflist ~p "
+                        "for reason ~p",
+                        [Index, {StartIdx, N}, Status]),
             requeue_exchange(Index, {StartIdx, N}, S)
     end.
 
@@ -271,7 +423,7 @@ start_exchange(Index, Preflist, Ring, S) ->
             {not_responsible, S};
         true ->
             %% TODO: check for not_registered
-            YZTree = get_tree(Index),
+            {ok, YZTree} = get_tree(Index, S),
             %% TODO: use async version in case vnode is backed up
             {ok, KVTree} = riak_kv_vnode:hashtree_pid(Index),
             case yz_exchange_fsm:start(Index, Preflist, YZTree,
@@ -279,13 +431,14 @@ start_exchange(Index, Preflist, Ring, S) ->
                 {ok, FsmPid} ->
                     Ref = monitor(process, FsmPid),
                     E = S#state.exchanges,
-                    {ok, S#state{exchanges=[{Index,Ref}|E]}};
+                    %% TODO: add timestamp so we know how long ago
+                    %%       exchange was started
+                    {ok, S#state{exchanges=[{Index,Ref,FsmPid}|E]}};
                 {error, Reason} ->
                     {Reason, S}
             end
     end.
 
-%% Exchanges between yz and KV are RPs
 -spec all_pairwise_exchanges(p(), ring()) -> [exchange()].
 all_pairwise_exchanges(Index, Ring) ->
     RPs = riak_kv_util:responsible_preflists(Index, Ring),
@@ -298,25 +451,39 @@ all_exchanges(Ring, Trees) ->
                           all_pairwise_exchanges(Index, Ring)
                   end, Indices).
 
--spec add_index_exchanges(p(), state()) -> state().
-add_index_exchanges(Index, S) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+-spec enqueue_exchange(p() | {p(), {p(),n()}}, state()) -> state().
+enqueue_exchange(E={_Index,_IndexN}, S) ->
+    case verify_exchange(E) of
+        true ->
+            enqueue_exchanges([E], S);
+        false ->
+            S
+    end;
+
+enqueue_exchange(Index, S) ->
+    Ring = yz_misc:get_ring(transformed),
     Exchanges = all_pairwise_exchanges(Index, Ring),
+    enqueue_exchanges(Exchanges, S).
+
+enqueue_exchanges(Exchanges, S) ->
     EQ = S#state.exchange_queue ++ Exchanges,
     S#state{exchange_queue=EQ}.
+
+-spec verify_exchange({p(), n()}) -> boolean().
+verify_exchange(E={Index,_N}) ->
+    Ring = yz_misc:get_ring(transformed),
+    ValidExchanges = all_pairwise_exchanges(Index, Ring),
+    lists:member(E, ValidExchanges).
 
 -spec already_exchanging(p(), state()) -> boolean().
 already_exchanging(Index, #state{exchanges=E}) ->
     case lists:keyfind(Index, 1, E) of
-        false ->
-            false;
-        {Index,_} ->
-            true
+        false -> false;
+        {Index,_,_} -> true
     end.
 
--spec maybe_exchange(state()) -> state().
-maybe_exchange(S) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
+-spec maybe_exchange(ring(), state()) -> state().
+maybe_exchange(Ring, S) ->
     case next_exchange(Ring, S) of
         {none, S2} ->
             S2;
@@ -343,7 +510,10 @@ init_next_exchange(S) ->
 -spec next_exchange(ring(), state()) -> {exchange(), state()} | {none, state()}.
 next_exchange(Ring, S=#state{exchange_queue=Exchanges}) ->
     More = fun() ->
-                   all_exchanges(Ring, S#state.trees)
+                   case S#state.mode of
+                       automatic -> all_exchanges(Ring, S#state.trees);
+                       manual -> []
+                   end
            end,
     case yz_misc:queue_pop(Exchanges, More) of
         {Exchange, Rest} ->
