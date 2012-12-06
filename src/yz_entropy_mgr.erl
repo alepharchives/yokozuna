@@ -186,6 +186,11 @@ handle_info(tick, S) ->
     S2 = maybe_tick(S),
     {noreply, S2};
 
+handle_info(reset_build_tokens, S) ->
+    S2 = reset_build_tokens(S),
+    schedule_reset_build_tokens(),
+    {noreply, S2};
+
 handle_info({'DOWN', Ref, _, Obj, Status}, S) ->
     %% NOTE: The down msg could be for exchange FSM or tree
     S2 = maybe_release_lock(Ref, S),
