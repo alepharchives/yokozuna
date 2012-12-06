@@ -92,7 +92,7 @@ get_lock(Tree, Type, Pid) ->
 
 %% @doc Poke the specified `Tree' to ensure the it is built/rebuilt as
 %%      needed. This is periodically called by the {@link
-%%      yz_entropy_manager}.
+%%      yz_entropy_mgr}.
 -spec poke(tree()) -> ok.
 poke(Tree) ->
     gen_server:cast(Tree, poke).
@@ -174,7 +174,7 @@ handle_cast(poke, S) ->
     {noreply, S2};
 
 handle_cast(build_failed, S) ->
-    yz_entropy_manager:requeue_poke(S#state.index),
+    yz_entropy_mgr:requeue_poke(S#state.index),
     S2 = S#state{built=false},
     {noreply, S2};
 
@@ -484,7 +484,7 @@ build_or_rehash(Self, S=#state{index=Index, trees=Trees}) ->
                false -> build;
                true  -> rehash
            end,
-    Lock = yz_entropy_manager:get_lock(Type),
+    Lock = yz_entropy_mgr:get_lock(Type),
     case {Lock, Type} of
         {ok, build} ->
             lager:info("Starting build: ~p", [Index]),
