@@ -274,7 +274,7 @@ reload_hashtrees(true, Ring, S=#state{mode=Mode, trees=Trees}) ->
                     end, [], MissingIdx),
     Trees2 = orddict:from_list(Trees ++ L),
 
-    Moved = [Idx || {Idx,_} <- Trees2, not lists:member(Idx, Indices)],
+    Moved = [E || E={Idx,_} <- Trees2, not lists:member(Idx, Indices)],
     Trees3 = remove_trees(Trees2, Moved),
 
     S2 = S#state{trees=Trees3},
@@ -292,10 +292,10 @@ reload_hashtrees(false, _, S) ->
 %% @private
 %%
 %% @doc Remove trees from `Trees' and destroy the hashtrees.
--spec remove_trees(trees(), [p()]) -> trees().
+-spec remove_trees(trees(), trees()) -> trees().
 remove_trees(Trees, ToRemove) ->
-    F = fun(Idx, TreesAcc) ->
-                yz_index_hashtree:destroy(Idx),
+    F = fun({Idx, Tree}, TreesAcc) ->
+                yz_index_hashtree:destroy(Tree),
                 orddict:erase(Idx, TreesAcc)
         end,
     lists:foldl(F, Trees, ToRemove).
