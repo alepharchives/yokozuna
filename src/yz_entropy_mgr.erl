@@ -268,7 +268,8 @@ reload_hashtrees(true, Ring, S=#state{mode=Mode, trees=Trees}) ->
 
     MissingIdx = [Idx || Idx <- Indices, not orddict:is_key(Idx, Existing)],
     L = lists:foldl(fun(Idx, NewTrees) ->
-                            {ok, Tree} = yz_index_hashtree:start(Idx),
+                            RPs = riak_kv_util:responsible_preflists(Idx),
+                            {ok, Tree} = yz_index_hashtree:start(Idx, RPs),
                             [{Idx,Tree}|NewTrees]
                     end, [], MissingIdx),
     Trees2 = orddict:from_list(Trees ++ L),
@@ -290,12 +291,13 @@ reload_hashtrees(false, _, S) ->
 
 %% @private
 %%
-%% @doc Remove trees from `Trees' and remove the hashtrees.
+%% @doc Remove trees from `Trees' and destroy the hashtrees.
 -spec remove_trees(trees(), [p()]) -> trees().
 remove_trees(Trees, ToRemove) ->
-    F = fun(Idx,TreesAcc) -> orddict:erase(Idx, TreesAcc) end,
-    %% TODO: finish this
-    [yz_index_hashtree:remove(Idx) || Idx <- ToRemove],
+    F = fun(Idx, TreesAcc) ->
+                yz_index_hashtree:destroy(Idx),
+                orddict:erase(Idx, TreesAcc)
+        end,
     lists:foldl(F, Trees, ToRemove).
 
 -spec do_get_lock(term(), pid(), state()) ->
