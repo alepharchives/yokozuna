@@ -1,9 +1,26 @@
+%% -------------------------------------------------------------------
+%%
+%% Copyright (c) 2012 Basho Technologies, Inc.  All Rights Reserved.
+%%
+%% This file is provided to you under the Apache License,
+%% Version 2.0 (the "License"); you may not use this file
+%% except in compliance with the License.  You may obtain
+%% a copy of the License at
+%%
+%%   http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing,
+%% software distributed under the License is distributed on an
+%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+%% KIND, either express or implied.  See the License for the
+%% specific language governing permissions and limitations
+%% under the License.
+%%
+%% -------------------------------------------------------------------
+
 -module(yz_index_hashtree).
 -behaviour(gen_server).
 -include("yokozuna.hrl").
-
-%% TODO: remove this
--include_lib("riak_kv/include/riak_kv_vnode.hrl").
 
 %% gen_server callbacks
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2,
@@ -20,17 +37,16 @@
 -compile(export_all).
 
 %% Time from build to expiration of tree, in microseconds.
--define(EXPIRE, 100000000).
+-define(DEFAULT_EXPIRE, 604800000). %% 1 week
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start(Index) ->
-    supervisor:start_child(yz_index_hashtree_sup, [Index]).
-
-start_link(Index) ->
-    gen_server:start_link(?MODULE, [Index], []).
+%% @doc Spawn a hashtree process that manages a hashtree for each
+%%      preflist `Index' is responsible for (`RPs').
+start(Index, RPs) ->
+    supervisor:start_child(yz_index_hashtree_sup, [Index, RPs]).
 
 %% @doc Insert the given `Key' and `Hash' pair on `Tree' for the given `Id'
 -spec insert({p(),n()}, binary(), binary(), tree(), list()) -> ok.
@@ -44,40 +60,32 @@ delete(BKey, Tree) ->
 
 -spec update({p(),n()}, tree()) -> ok.
 update(Id, Tree) ->
-    put(calling, ?LINE),
     gen_server:call(Tree, {update_tree, Id}, infinity).
 
-%% @doc Build the trees if they need to be built.
--spec build(tree()) -> ok.
-build(Tree) ->
-    gen_server:cast(Tree, build).
-
-exchange_bucket(Id, Level, Bucket, Tree) ->
-    put(calling, ?LINE),
-    gen_server:call(Tree, {exchange_bucket, Id, Level, Bucket}, infinity).
-
-exchange_segment(Id, Segment, Tree) ->
-    put(calling, ?LINE),
-    gen_server:call(Tree, {exchange_segment, Id, Segment}, infinity).
-
+-spec compare({p(),n()}, hashtree:remote_fun(), tree()) ->
+                     [hashtree:keydiff()].
 compare(Id, Remote, Tree) ->
     compare(Id, Remote, undefined, Tree).
 
+-spec compare({p(),n()}, hashtree:remote_fun(),
+              undefined | hashtree:acc_fun(T), tree()) -> T.
 compare(Id, Remote, AccFun, Tree) ->
-    put(calling, ?LINE),
     gen_server:call(Tree, {compare, Id, Remote, AccFun}, infinity).
 
 get_index(Tree) ->
     gen_server:call(Tree, get_index, infinity).
 
+%% @doc Acquire the lock for the specified index_hashtree if not already
+%%      locked, and associate the lock with the calling process.
+-spec get_lock(tree(), term()) -> ok | not_build | already_locked.
 get_lock(Tree, Type) ->
     get_lock(Tree, Type, self()).
 
+%% @doc Acquire the lock for the specified index_hashtree if not already
+%%      locked, and associate the lock with the provided pid.
+-spec get_lock(tree(), term(), pid()) -> ok | not_build | already_locked.
 get_lock(Tree, Type, Pid) ->
-    put(tree, Tree),
-    put(calling, ?LINE),
     gen_server:call(Tree, {get_lock, Type, Pid}, infinity).
-
 
 %% @doc Poke the specified `Tree' to ensure the it is built/rebuilt as
 %%      needed. This is periodically called by the {@link
@@ -86,19 +94,142 @@ get_lock(Tree, Type, Pid) ->
 poke(Tree) ->
     gen_server:cast(Tree, poke).
 
+%% @doc Terminate the `Tree'.
+stop(Tree) ->
+    gen_server:cast(Tree, stop).
+
+%% @doc Destroy the specified `Tree', which will destroy all
+%%      associated hashtrees and terminate.
+-spec destroy(tree()) -> ok.
+destroy(Tree) ->
+    gen_server:call(Tree, destroy, infinity).
+
+
 %%%===================================================================
 %%% gen_server callbacks
 %%%===================================================================
 
-init([Index]) ->
-    Path = filename:join(?YZ_HASHTREES_BASE_PATH, integer_to_list(Index)),
-    RPs = riak_kv_util:responsible_preflists(Index),
-    S = #state{index=Index,
-               trees=orddict:new(),
-               built=false,
-               path=Path},
-    S2 = init_trees(RPs, S),
-    {ok, S2}.
+init([Index, RPs]) ->
+    case determine_data_root() of
+        undefined ->
+            case riak_kv_entropy_manager:enabled() of
+                true ->
+                    lager:warning("Neither yokozuna/anti_entropy_data_dir or "
+                                  "riak_core/platform_data_dir are defined. "
+                                  "Disabling active anti-entropy."),
+                    riak_kv_entropy_manager:disable();
+                false ->
+                    ok
+            end,
+            ignore;
+        Root ->
+            Path = filename:join(Root, integer_to_list(Index)),
+            S = #state{index=Index,
+                       trees=orddict:new(),
+                       built=false,
+                       path=Path},
+            S2 = init_trees(RPs, S),
+            {ok, S2}
+    end.
+
+handle_call(get_index, _From, S) ->
+    {reply, S#state.index, S};
+
+handle_call({get_lock, Type, Pid}, _From, S) ->
+    {Reply, S2} = do_get_lock(Type, Pid, S),
+    {reply, Reply, S2};
+
+handle_call({update_tree, Id}, From, S) ->
+    lager:debug("Updating tree for partition ~p preflist ~p",
+               [S#state.index, Id]),
+    apply_tree(Id,
+               fun(Tree) ->
+                       {SnapTree, Tree2} = hashtree:update_snapshot(Tree),
+                       spawn_link(fun() ->
+                                          hashtree:update_perform(SnapTree),
+                                          gen_server:reply(From, ok)
+                                  end),
+                       {noreply, Tree2}
+               end,
+               S);
+
+handle_call({compare, Id, Remote, AccFun}, From, S) ->
+    do_compare(Id, Remote, AccFun, From, S),
+    {noreply, S};
+
+handle_call(destroy, _From, S) ->
+    {_,Tree0} = hd(S#state.trees),
+    hashtree:destroy(Tree0),
+    {stop, normal, ok, S};
+
+handle_call(_Request, _From, S) ->
+    Reply = ok,
+    {reply, Reply, S}.
+
+handle_cast(poke, S) ->
+    S2 = do_poke(S),
+    {noreply, S2};
+
+handle_cast(build_failed, S) ->
+    yz_entropy_manager:requeue_poke(S#state.index),
+    S2 = S#state{built=false},
+    {noreply, S2};
+
+handle_cast(build_finished, S) ->
+    S2 = do_build_finished(S),
+    {noreply, S2};
+
+handle_cast({insert, Id, Key, Hash, Options}, S) ->
+    S2 = do_insert(Id, Key, Hash, Options, S),
+    {noreply, S2};
+
+handle_cast({delete, BKey}, S) ->
+    IndexN = get_index_n(BKey, yz_misc:get_ring(transformed)),
+    S2 = do_delete(IndexN, term_to_binary(BKey), S),
+    {noreply, S2};
+
+handle_cast(stop, S) ->
+    {_,Tree0} = hd(S#state.trees),
+    hashtree:close(Tree0),
+    {stop, normal, S};
+
+handle_cast(_Msg, S) ->
+    {noreply, S}.
+
+handle_info({'DOWN', Ref, _, _, _}, S) ->
+    S2 = maybe_release_lock(Ref, S),
+    {noreply, S2};
+
+handle_info(_Info, S) ->
+    {noreply, S}.
+
+terminate(_Reason, _) ->
+    ok.
+
+code_change(_OldVsn, S, _Extra) ->
+    {ok, S}.
+
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+-spec determine_data_root() -> string() | undefined.
+determine_data_root() ->
+    case ?YZ_AE_DIR of
+        {ok, EntropyRoot} ->
+            EntropyRoot;
+        undefined ->
+            case ?DATA_DIR of
+                {ok, PlatformRoot} ->
+                    Root = filename:join(PlatformRoot, "yz_anti_entropy"),
+                    lager:warning("Config yokozuna/anti_entropy_data_dir is "
+                                  "missing. Defaulting to: ~p", [Root]),
+                    application:set_env(?YZ_APP_NAME, anti_entropy_data_dir, Root),
+                    Root;
+                undefined ->
+                    undefined
+            end
+    end.
 
 -spec init_trees([{p(),n()}], state()) -> state().
 init_trees(RPs, S) ->
@@ -107,16 +238,15 @@ init_trees(RPs, S) ->
                          end, S, RPs),
     S2#state{built=false}.
 
-%% TODO: If one is build they are all built?
+-spec load_built(state()) -> boolean().
 load_built(#state{trees=Trees}) ->
     {_,Tree0} = hd(Trees),
     case hashtree:read_meta(<<"built">>, Tree0) of
-        {ok, <<1>>} ->
-            true;
-        _ ->
-            false
+        {ok, <<1>>} -> true;
+        _ -> false
     end.
 
+-spec fold_keys(p(), tree()) -> ok.
 fold_keys(Partition, Tree) ->
     LI = yz_cover:logical_index(yz_misc:get_ring(transformed)),
     LogicalPartition = yz_cover:logical_partition(LI, Partition),
@@ -131,109 +261,9 @@ fold_keys(Partition, Tree) ->
     [yz_entropy:iterate_entropy_data(Core, Filter, F) || Core <- Cores],
     ok.
 
-handle_call(get_index, _From, S) ->
-    {reply, S#state.index, S};
-
-handle_call({get_lock, Type, Pid}, _From, State) ->
-    {Reply, State2} = do_get_lock(Type, Pid, State),
-    {reply, Reply, State2};
-
-handle_call({update_tree, Id}, From, S) ->
-    lager:info("Updating tree for partition ~p preflist ~p",
-               [S#state.index, Id]),
-    apply_tree(Id,
-               fun(Tree) ->
-                       {SnapTree, Tree2} = hashtree:update_snapshot(Tree),
-                       spawn_link(fun() ->
-                                          hashtree:update_perform(SnapTree),
-                                          gen_server:reply(From, ok)
-                                  end),
-                       {noreply, Tree2}
-               end,
-               S);
-
-handle_call({exchange_bucket, Id, Level, Bucket}, _From, State) ->
-    apply_tree(Id,
-               fun(Tree) ->
-                       Result = hashtree:get_bucket(Level, Bucket, Tree),
-                       {Result, Tree}
-               end,
-               State);
-
-handle_call({exchange_segment, Id, Segment}, _From, State) ->
-    apply_tree(Id,
-               fun(Tree) ->
-                       [{_, Result}] = hashtree:key_hashes(Tree, Segment),
-                       {Result, Tree}
-               end,
-               State);
-
-handle_call({compare, Id, Remote, AccFun}, From, State) ->
-    Tree = orddict:fetch(Id, State#state.trees),
-    spawn(fun() ->
-                  Result = case AccFun of
-                               undefined ->
-                                   hashtree:compare(Tree, Remote);
-                               _ ->
-                                   hashtree:compare(Tree, Remote, AccFun)
-                           end,
-                  gen_server:reply(From, Result)
-          end),
-    {noreply, State};
-
-handle_call(_Request, _From, State) ->
-    Reply = ok,
-    {reply, Reply, State}.
-
-handle_cast(poke, State) ->
-    State2 = do_poke(State),
-    {noreply, State2};
-
-handle_cast(build, S) ->
-    S2 = maybe_build(S),
-    {noreply, S2};
-
-handle_cast(build_failed, State) ->
-    yz_entropy_manager:requeue_poke(State#state.index),
-    State2 = State#state{built=false},
-    {noreply, State2};
-handle_cast(build_finished, State) ->
-    State2 = do_build_finished(State),
-    {noreply, State2};
-
-handle_cast({insert, Id, Key, Hash, Options}, State) ->
-    State2 = do_insert(Id, Key, Hash, Options, State),
-    {noreply, State2};
-
-handle_cast({delete, BKey}, State) ->
-    {ok, Ring} = riak_core_ring_manager:get_my_ring(),
-    IndexN = get_index_n(BKey, Ring),
-    State2 = do_delete(IndexN, term_to_binary(BKey), State),
-    {noreply, State2};
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info({'DOWN', Ref, _, _, _}, State) ->
-    State2 = maybe_release_lock(Ref, State),
-    {noreply, State2};
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
-
 -spec do_new_tree({p(),n()}, state()) -> state().
-do_new_tree(Id, State=#state{trees=Trees, path=Path}) ->
-    Index = State#state.index,
+do_new_tree(Id, S=#state{trees=Trees, path=Path}) ->
+    Index = S#state.index,
     IdBin = tree_id(Id),
     NewTree = case Trees of
                   [] ->
@@ -242,94 +272,133 @@ do_new_tree(Id, State=#state{trees=Trees, path=Path}) ->
                       hashtree:new({Index,IdBin}, Other)
               end,
     Trees2 = orddict:store(Id, NewTree, Trees),
-    State#state{trees=Trees2}.
+    S#state{trees=Trees2}.
 
-do_get_lock(_, _, State) when State#state.built /= true ->
-    lager:info("Not built: ~p :: ~p", [State#state.index, State#state.built]),
-    {not_built, State};
-do_get_lock(_Type, Pid, State=#state{lock=undefined}) ->
+-spec do_get_lock(term(), pid(), state()) ->
+                         {ok | not_build | already_locked, state()}.
+do_get_lock(_, _, S) when S#state.built /= true ->
+    lager:debug("Not built: ~p", [S#state.index]),
+    {not_built, S};
+
+do_get_lock(_Type, Pid, S=#state{lock=undefined}) ->
     Ref = monitor(process, Pid),
-    State2 = State#state{lock=Ref},
-    %% lager:info("Locked: ~p", [State#state.index]),
-    {ok, State2};
-do_get_lock(_, _, State) ->
-    lager:info("Already locked: ~p", [State#state.index]),
-    {already_locked, State}.
+    S2 = S#state{lock=Ref},
+    {ok, S2};
 
-maybe_release_lock(Ref, State) ->
-    case State#state.lock of
-        Ref ->
-            %% lager:info("Unlocked: ~p", [State#state.index]),
-            State#state{lock=undefined};
-        _ ->
-            State
+do_get_lock(_, _, S) ->
+    lager:debug("Already locked: ~p", [S#state.index]),
+    {already_locked, S}.
+
+-spec maybe_release_lock(reference(), state()) -> state().
+maybe_release_lock(Ref, S) ->
+    case S#state.lock of
+        Ref -> S#state{lock=undefined};
+        _ -> S
     end.
 
-apply_tree(Id, Fun, State=#state{trees=Trees}) ->
+%% @private
+%%
+%% @doc Utility function for passing a specific hashtree into a
+%%      provided function and storing the possibly-modified hashtree
+%%      back in the index_hashtree state.
+-spec apply_tree({p(),n()},
+                 fun((hashtree()) -> {'noreply' | any(), hashtree()}),
+                 state())
+                -> {'reply', 'not_responsible', state()} |
+                   {'reply', any(), state()} |
+                   {'noreply', state()}.
+apply_tree(Id, Fun, S=#state{trees=Trees}) ->
     case orddict:find(Id, Trees) of
         error ->
-            {reply, not_responsible, State};
+            {reply, not_responsible, S};
         {ok, Tree} ->
             {Result, Tree2} = Fun(Tree),
             Trees2 = orddict:store(Id, Tree2, Trees),
-            State2 = State#state{trees=Trees2},
+            S2 = S#state{trees=Trees2},
             case Result of
-                noreply ->
-                    {noreply, State2};
-                _ ->
-                    {reply, Result, State2}
+                noreply -> {noreply, S2};
+                _ -> {reply, Result, S2}
             end
     end.
 
-do_build_finished(State=#state{index=Index, built=_Pid}) ->
-    lager:info("Finished build (b): ~p", [Index]),
-    {_,Tree0} = hd(State#state.trees),
+-spec do_build_finished(state()) -> state().
+do_build_finished(S=#state{index=Index, built=_Pid}) ->
+    lager:info("Finished build: ~p", [Index]),
+    {_,Tree0} = hd(S#state.trees),
     hashtree:write_meta(<<"built">>, <<1>>, Tree0),
-    State#state{built=true, build_time=os:timestamp()}.
+    S#state{built=true, build_time=os:timestamp()}.
 
-do_insert(Id, Key, Hash, Opts, State=#state{trees=Trees}) ->
-    %% lager:info("Insert into ~p/~p :: ~p / ~p", [State#state.index, Id, Key, Hash]),
+-spec do_insert({p(),n()}, binary(), binary(), proplist(), state()) -> state().
+do_insert(Id, Key, Hash, Opts, S=#state{trees=Trees}) ->
     case orddict:find(Id, Trees) of
         {ok, Tree} ->
             Tree2 = hashtree:insert(Key, Hash, Tree, Opts),
             Trees2 = orddict:store(Id, Tree2, Trees),
-            State#state{trees=Trees2};
+            S#state{trees=Trees2};
         _ ->
-            State2 = handle_unexpected_key(Id, Key, State),
-            State2
+            handle_unexpected_key(Id, Key, S)
     end.
 
-do_delete(Id, Key, State=#state{trees=Trees}) ->
+-spec do_delete({p(),n()}, binary(), state()) -> state().
+do_delete(Id, Key, S=#state{trees=Trees}) ->
     case orddict:find(Id, Trees) of
         {ok, Tree} ->
             Tree2 = hashtree:delete(Key, Tree),
             Trees2 = orddict:store(Id, Tree2, Trees),
-            State#state{trees=Trees2};
+            S#state{trees=Trees2};
         _ ->
-            State2 = handle_unexpected_key(Id, Key, State),
-            State2
+            handle_unexpected_key(Id, Key, S)
     end.
 
-handle_unexpected_key(Id, Key, State=#state{index=Partition}) ->
+-spec handle_unexpected_key({p(),n()}, binary(), state()) -> state().
+handle_unexpected_key(Id, Key, S=#state{index=Partition}) ->
     RP = riak_kv_util:responsible_preflists(Partition),
     case lists:member(Id, RP) of
         false ->
+            %% The encountered object does not belong to any preflists thata
+            %% this partition is associated with. Under normal Riak operation,
+            %% this should only happen when the `n_val' for an object is
+            %% reduced. For example, write an object with N=3, then change N to
+            %% 2. There will be an extra replica of the object that is no
+            %% longer needed. We should probably just delete these objects, but
+            %% to be safe rather than sorry, the first version of AAE simply
+            %% ignores these objects.
+            %%
+            %% TODO: We should probably remove these warnings before final
+            %%       release, as reducing N will result in a ton of log/console
+            %%       spam.
             lager:warning("Object ~p encountered during fold over partition "
                           "~p, but key does not hash to an index handled by "
                           "this partition", [Key, Partition]),
-            State;
+            S;
+
         true ->
+            %% The encountered object belongs to a preflist that is currently
+            %% associated with this partition, but was not when the
+            %% index_hashtree process was created. This occurs when increasing
+            %% the `n_val' for an object. For example, write an object with N=3
+            %% and it will map to the index/n preflist `{<index>, 3}'. Increase
+            %% N to 4, and the object now maps to preflist '{<index>, 4}' which
+            %% may not have an existing hashtree if there were previously no
+            %% objects with N=4.
             lager:info("Partition/tree ~p/~p does not exist to hold object ~p",
                        [Partition, Id, Key]),
-            case State#state.built of
+            case S#state.built of
                 true ->
+                    %% If the tree is already built, clear the tree to trigger
+                    %% a rebuild that will re-distribute objects into the
+                    %% proper hashtrees based on current N values.
                     lager:info("Clearing tree to trigger future rebuild"),
-                    clear_tree(State);
+                    clear_tree(S);
                 _ ->
-                    %% Initialize new index_n tree to prevent future errors,
-                    %% but state may be inconsistent until future rebuild
-                    State2 = do_new_tree(Id, State),
-                    State2
+                    %% Initialize a new index_n tree to prevent future errors.
+                    %% The various hashtrees will likely be inconsistent, with
+                    %% some trees containing key/hash pairs that should be in
+                    %% other trees (eg. due to a change in N value). This will
+                    %% be resolved whenever trees are eventually rebuilt, either
+                    %% after normal expiration or after a future unexpected value
+                    %% triggers the alternate case clause above.
+                    do_new_tree(Id, S)
             end
     end.
 
@@ -338,6 +407,28 @@ tree_id({Index, N}) ->
     <<Index:160/integer,N:16/integer>>;
 tree_id(_) ->
     erlang:error(badarg).
+
+%% TODO: handle non-existent tree
+do_compare(Id, Remote, AccFun, From, S) ->
+    case orddict:find(Id, S#state.trees) of
+        error ->
+            %% This case shouldn't happen, but might as well safely handle it.
+            lager:warning("Tried to compare nonexistent tree "
+                          "(vnode)=~p (preflist)=~p", [S#state.index, Id]),
+            gen_server:reply(From, []);
+        {ok, Tree} ->
+            spawn_link(
+              fun() ->
+                      Result = case AccFun of
+                                   undefined ->
+                                       hashtree:compare(Tree, Remote);
+                                   _ ->
+                                       hashtree:compare(Tree, Remote, AccFun)
+                               end,
+                      gen_server:reply(From, Result)
+              end)
+    end,
+    ok.
 
 %% TODO: OMG cache this with entry in proc dict, use `_yz_fp` as Index
 %%       and keep an orddict(Bucket,N) in proc dict
@@ -352,24 +443,24 @@ get_index_n({Bucket, Key}, Ring) ->
     Index = riak_core_ring:responsible_index(ChashKey, Ring),
     {Index, N}.
 
-do_poke(State) ->
-    State1 = maybe_clear(State),
-    State2 = maybe_build(State1),
-    State2.
+do_poke(S) ->
+    maybe_build(maybe_clear(S)).
 
-maybe_clear(State=#state{lock=undefined, built=true}) ->
-    Diff = timer:now_diff(os:timestamp(), State#state.build_time),
-    case Diff > ?EXPIRE of
-        true ->
-            clear_tree(State);
-        false ->
-            State
+maybe_clear(S=#state{lock=undefined, built=true}) ->
+    Diff = timer:now_diff(os:timestamp(), S#state.build_time),
+    Expire = app_helper:get_env(riak_kv,
+                                anti_entropy_expire,
+                                ?DEFAULT_EXPIRE),
+    case Diff > (Expire * 1000)  of
+        true -> clear_tree(S);
+        false -> S
     end;
-maybe_clear(State) ->
-    State.
+
+maybe_clear(S) ->
+    S.
 
 clear_tree(S=#state{index=Index, trees=Trees}) ->
-    lager:info("Clearing tree ~p", [S#state.index]),
+    lager:debug("Clearing tree ~p", [S#state.index]),
     {_,Tree0} = hd(Trees),
     hashtree:destroy(Tree0),
     IndexN = riak_kv_util:responsible_preflists(Index),
@@ -378,29 +469,30 @@ clear_tree(S=#state{index=Index, trees=Trees}) ->
 
 maybe_build(S=#state{built=false}) ->
     Self = self(),
-    Pid = spawn_link(fun() ->
-                             case yz_entropy_mgr:get_lock(build) of
-                                 max_concurrency ->
-                                     gen_server:cast(Self, build_failed);
-                                 ok ->
-                                     build_or_rehash(Self, S)
-                             end
-                     end),
+    Pid = spawn_link(fun() -> build_or_rehash(Self, S) end),
     S#state{built=Pid};
+
 maybe_build(S) ->
     %% Already built or build in progress
     S.
 
 build_or_rehash(Self, S=#state{index=Index, trees=Trees}) ->
-    case load_built(S) of
-        false ->
+    Type = case load_built(S) of
+               false -> build;
+               true  -> rehash
+           end,
+    Lock = yz_entropy_manager:get_lock(Type),
+    case {Lock, Type} of
+        {ok, build} ->
             lager:info("Starting build: ~p", [Index]),
             fold_keys(Index, Self),
-            lager:info("Finished build (a): ~p", [Index]),
+            lager:info("Finished build: ~p", [Index]),
             gen_server:cast(Self, build_finished);
-        true ->
+        {ok, rehash} ->
             lager:info("Starting rehash: ~p", [Index]),
             _ = [hashtree:rehash_tree(T) || {_,T} <- Trees],
-            lager:info("Finished rehash (a): ~p", [Index]),
-            gen_server:cast(Self, build_finished)
+            lager:info("Finished rehash: ~p", [Index]),
+            gen_server:cast(Self, build_finished);
+        {_Error, _} ->
+            gen_server:cast(Self, build_failed)
     end.

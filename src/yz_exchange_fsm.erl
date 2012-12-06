@@ -136,7 +136,7 @@ key_exchange(timeout, S=#state{index=Index,
                                  end, Acc, KeyDiff)
              end,
 
-    case riak_kv_index_hashtree:compare(IndexN, Remote, AccFun, YZTree) of
+    case yz_index_hashtree:compare(IndexN, Remote, AccFun, YZTree) of
         [] ->
             ok;
         [Count] ->
