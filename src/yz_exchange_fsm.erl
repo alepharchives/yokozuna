@@ -1,3 +1,23 @@
+%% -------------------------------------------------------------------
+%%
+%% Copyright (c) 2012 Basho Technologies, Inc.  All Rights Reserved.
+%%
+%% This file is provided to you under the Apache License,
+%% Version 2.0 (the "License"); you may not use this file
+%% except in compliance with the License.  You may obtain
+%% a copy of the License at
+%%
+%%   http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing,
+%% software distributed under the License is distributed on an
+%% "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+%% KIND, either express or implied.  See the License for the
+%% specific language governing permissions and limitations
+%% under the License.
+%%
+%% -------------------------------------------------------------------
+
 -module(yz_exchange_fsm).
 -behaviour(gen_fsm).
 -include("yokozuna.hrl").
@@ -12,7 +32,10 @@
                 yz_tree :: tree(),
                 kv_tree :: tree(),
                 built :: integer(),
-                from :: any()}).
+                timeout :: pos_integer()}).
+
+%% Per state transition timeout used by certain transitions
+-define(DEFAULT_ACTION_TIMEOUT, 300000). %% 5 minutes
 
 %%%===================================================================
 %%% API
@@ -29,16 +52,11 @@ start(Index, Preflist, YZTree, KVTree, Manager) ->
 %%% gen_fsm callbacks
 %%%===================================================================
 
-%% step1: have Index and Preflist for exchange - pass to fsm
-%%
-%% step2: try to aquie lock from yz mgr and kv mgr
-%%
-%% step3: get pid of yz tree from mgr and kv tree from my
-%%
-%% step4: aquire lock from yz tree and kv tree
-%%
-%% step5: start exchange of Preflist between yz and kv tree
 init([Index, Preflist, YZTree, KVTree, Manager]) ->
+    Timeout = app_helper:get_env(riak_kv,
+                                 anti_entropy_timeout,
+                                 ?DEFAULT_ACTION_TIMEOUT),
+
     monitor(process, Manager),
     monitor(process, YZTree),
     monitor(process, KVTree),
@@ -47,16 +65,41 @@ init([Index, Preflist, YZTree, KVTree, Manager]) ->
                index_n=Preflist,
                yz_tree=YZTree,
                kv_tree=KVTree,
-               built=0},
+               built=0,
+               timeout=Timeout},
     gen_fsm:send_event(self(), start_exchange),
     lager:debug("Starting exchange between KV and Yokozuna: ~p", [Index]),
     {ok, prepare_exchange, S}.
+
+handle_event(_Event, StateName, S) ->
+    {next_state, StateName, S}.
+
+handle_sync_event(_Event, _From, StateName, S) ->
+    {reply, ok, StateName, S}.
+
+handle_info({'DOWN', _, _, _, _}, _StateName, S) ->
+    %% Either the entropy manager, local hashtree, or remote hashtree has
+    %% exited. Stop exchange.
+    {stop, normal, S};
+
+handle_info(_Info, StateName, S) ->
+    {next_state, StateName, S}.
+
+terminate(_Reason, _StateName, _S) ->
+    ok.
+
+code_change(_OldVsn, StateName, S, _Extra) ->
+    {ok, StateName, S}.
+
+%%%===================================================================
+%%% States
+%%%===================================================================
 
 prepare_exchange(start_exchange, S) ->
     YZTree = S#state.yz_tree,
     KVTree = S#state.kv_tree,
 
-    case yz_entropy_mgr:get_lock(exchange) of
+    case yz_entropy_mgr:get_lock(?MODULE) of
         ok ->
             case yz_index_hashtree:get_lock(YZTree, ?MODULE) of
                 ok ->
@@ -128,10 +171,8 @@ key_exchange(timeout, S=#state{index=Index,
                      lists:foldl(fun(Diff, Acc2) ->
                                          read_repair_keydiff(RC, Diff),
                                          case Acc2 of
-                                             [] ->
-                                                 [1];
-                                             [Count] ->
-                                                 [Count+1]
+                                             [] -> [1];
+                                             [Count] -> [Count+1]
                                          end
                                  end, Acc, KeyDiff)
              end,
@@ -145,6 +186,19 @@ key_exchange(timeout, S=#state{index=Index,
     end,
     {stop, normal, S}.
 
+%%%===================================================================
+%%% Internal functions
+%%%===================================================================
+
+%% @private
+exchange_bucket_kv(Tree, IndexN, Level, Bucket) ->
+    riak_kv_index_hashtree:exchange_bucket(IndexN, Level, Bucket, Tree).
+
+%% @private
+exchange_segment_kv(Tree, IndexN, Segment) ->
+    riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
+
+%% @private
 read_repair_keydiff(RC, {_, KeyBin}) ->
     BKey = {Bucket, Key} = binary_to_term(KeyBin),
     lager:debug("Anti-entropy forced read repair and re-index: ~p/~p", [Bucket, Key]),
@@ -160,48 +214,20 @@ read_repair_keydiff(RC, {_, KeyBin}) ->
                   end, Preflist),
     ok.
 
+%% @private
 fake_kv_vnode_state(Partition) ->
     {state,Partition,fake,fake,fake,fake,fake,fake,fake,fake,fake,fake,fake}.
 
-exchange_bucket_kv(Tree, IndexN, Level, Bucket) ->
-    riak_kv_index_hashtree:exchange_bucket(IndexN, Level, Bucket, Tree).
-
-exchange_segment_kv(Tree, IndexN, Segment) ->
-    riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
-
-handle_event(_Event, StateName, State) ->
-    {next_state, StateName, State}.
-
-handle_sync_event(_Event, _From, StateName, State) ->
-    {reply, ok, StateName, State}.
-
-handle_info({'DOWN', _, _, _, _}, _StateName, State) ->
-    %% Either the entropy manager, local hashtree, or remote hashtree has
-    %% exited. Stop exchange.
-    {stop, normal, State};
-handle_info(_Info, StateName, State) ->
-    {next_state, StateName, State}.
-
-terminate(_Reason, _StateName, _State) ->
-    ok.
-
-code_change(_OldVsn, StateName, State, _Extra) ->
-    {ok, StateName, State}.
-
-%%%===================================================================
-%%% Internal functions
-%%%===================================================================
-
+%% @private
 update_request(Module, Tree, Index, IndexN) ->
     as_event(fun() ->
                      case Module:update(IndexN, Tree) of
-                         ok ->
-                             {tree_built, Index, IndexN};
-                         not_responsible ->
-                             {not_responsible, Index, IndexN}
+                         ok -> {tree_built, Index, IndexN};
+                         not_responsible -> {not_responsible, Index, IndexN}
                      end
              end).
 
+%% @private
 as_event(F) ->
     Self = self(),
     spawn_link(fun() ->
@@ -210,12 +236,14 @@ as_event(F) ->
                end),
     ok.
 
+%% @private
 do_timeout(S=#state{index=Index, index_n=Preflist}) ->
     lager:info("Timeout during exchange of partition ~p for preflist ~p ",
                [Index, Preflist]),
     send_exchange_status({timeout, Index, Preflist}, S),
     {stop, normal, S}.
 
+%% @private
 send_exchange_status(Status, #state{index=Index,
                                     index_n=IndexN}) ->
     yz_entropy_mgr:exchange_status(Index, IndexN, Status).
