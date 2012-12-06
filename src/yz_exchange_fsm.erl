@@ -199,6 +199,15 @@ exchange_segment_kv(Tree, IndexN, Segment) ->
     riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
 
 %% @private
+read_repair_keydiff(RC, {remote_missing, KeyBin}) ->
+    %% In this case KV is missing the key but Yokozuna has it.
+    %% Currently the Yokozuna entropy data may include keys that have
+    %% been deleted.  This is becuse of how deletion works in
+    %% Lucene/Solr.  Since KV is the authorative source on data if it
+    %% believes the data is missing then there is no need to repair
+    %% anything.
+    ok;
+
 read_repair_keydiff(RC, {_, KeyBin}) ->
     BKey = {Bucket, Key} = binary_to_term(KeyBin),
     lager:debug("Anti-entropy forced read repair and re-index: ~p/~p", [Bucket, Key]),
