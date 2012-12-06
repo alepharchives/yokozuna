@@ -326,7 +326,7 @@ apply_tree(Id, Fun, S=#state{trees=Trees}) ->
 
 -spec do_build_finished(state()) -> state().
 do_build_finished(S=#state{index=Index, built=_Pid}) ->
-    lager:info("Finished build: ~p", [Index]),
+    lager:debug("Finished build: ~p", [Index]),
     {_,Tree0} = hd(S#state.trees),
     hashtree:write_meta(<<"built">>, <<1>>, Tree0),
     S#state{built=true, build_time=os:timestamp()}.
@@ -487,14 +487,14 @@ build_or_rehash(Self, S=#state{index=Index, trees=Trees}) ->
     Lock = yz_entropy_mgr:get_lock(Type),
     case {Lock, Type} of
         {ok, build} ->
-            lager:info("Starting build: ~p", [Index]),
+            lager:debug("Starting build: ~p", [Index]),
             fold_keys(Index, Self),
-            lager:info("Finished build: ~p", [Index]),
+            lager:debug("Finished build: ~p", [Index]),
             gen_server:cast(Self, build_finished);
         {ok, rehash} ->
-            lager:info("Starting rehash: ~p", [Index]),
+            lager:debug("Starting rehash: ~p", [Index]),
             _ = [hashtree:rehash_tree(T) || {_,T} <- Trees],
-            lager:info("Finished rehash: ~p", [Index]),
+            lager:debug("Finished rehash: ~p", [Index]),
             gen_server:cast(Self, build_finished);
         {_Error, _} ->
             gen_server:cast(Self, build_failed)
