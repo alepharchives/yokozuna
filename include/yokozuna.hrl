@@ -96,7 +96,7 @@
 -define(INT_TO_STR(I), integer_to_list(I)).
 -define(PARTITION_BINARY(S), S#state.partition_binary).
 
--define(DATA_DIR, app_helper:get_env(riak_core, platform_data_dir)).
+-define(DATA_DIR, application:get_env(riak_core, platform_data_dir)).
 
 -define(YZ_DEFAULT_SOLR_PORT, "8983").
 -define(YZ_DEFAULT_SOLR_STARTUP_WAIT, 15).
@@ -120,7 +120,7 @@
 %%%===================================================================
 
 -define(YZ_AE_DIR,
-        app_helper:get_env(?YZ_APP_NAME, anti_entropy_data_dir)).
+        application:get_env(?YZ_APP_NAME, anti_entropy_data_dir)).
 -define(YZ_ENTROPY_TICK,
         app_helper:get_env(?YZ_APP_NAME, entropy_tick, 60000)).
 
