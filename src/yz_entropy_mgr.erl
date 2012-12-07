@@ -415,7 +415,10 @@ maybe_poke_tree(S) ->
 -spec do_exchange_status(pid(), p(), {p(), n()}, any(), state()) -> state().
 do_exchange_status(_Pid, Index, {StartIdx, N}, Status, S) ->
     case Status of
-        ok -> S;
+        ok ->
+            lager:debug("Finished exhcange for partition ~p of preflist ~p",
+                        [Index, {StartIdx, N}]),
+            S;
         _ ->
             lager:debug("Requeue exhcange for partition ~p of preflist ~p "
                         "for reason ~p",
