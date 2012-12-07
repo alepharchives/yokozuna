@@ -16,16 +16,18 @@
 
 package com.basho.yokozuna.handler;
 
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import java.io.IOException;
 
 import org.apache.commons.codec.binary.Base64;
 
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.index.AtomicReader;
+import org.apache.lucene.index.DocsEnum;
 import org.apache.lucene.index.Term;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
 
 import org.apache.solr.common.SolrDocument;
 import org.apache.solr.common.SolrDocumentList;
@@ -129,32 +131,36 @@ public class EntropyData
             String hash = null;
             int count = 0;
             BytesRef current = null;
+            DocsEnum de = null;
+            Bits liveDocs = rdr.getLiveDocs();
 
             while(!endOfItr(tmp) && count < n) {
-                current = BytesRef.deepCopyOf(tmp);
-                text = tmp.utf8ToString();
-                log.debug("text: " + text);
-                vals = text.split(" ");
-                ts = vals[0];
+                if (isLive(liveDocs, te)) {
+                    current = BytesRef.deepCopyOf(tmp);
+                    text = tmp.utf8ToString();
+                    log.debug("text: " + text);
+                    vals = text.split(" ");
+                    ts = vals[0];
 
-                // TODO: what if null?
-                if (! (ts.compareTo(before) < 0)) {
-                    rsp.add("more", false);
-                    docs.setNumFound(count);
-                    return;
-                }
+                    // TODO: what if null?
+                    if (! (ts.compareTo(before) < 0)) {
+                        rsp.add("more", false);
+                        docs.setNumFound(count);
+                        return;
+                    }
 
-                docPartition = vals[1];
-                riakBucket = vals[2];
-                riakKey = vals[3];
-                hash = vals[4];
-                if (partition.equals(docPartition)) {
-                    SolrDocument tmpDoc = new SolrDocument();
-                    tmpDoc.addField("riak_bucket", riakBucket);
-                    tmpDoc.addField("riak_key", riakKey);
-                    tmpDoc.addField("base64_hash", hash);
-                    docs.add(tmpDoc);
-                    count++;
+                    docPartition = vals[1];
+                    riakBucket = vals[2];
+                    riakKey = vals[3];
+                    hash = vals[4];
+                    if (partition.equals(docPartition)) {
+                        SolrDocument tmpDoc = new SolrDocument();
+                        tmpDoc.addField("riak_bucket", riakBucket);
+                        tmpDoc.addField("riak_key", riakKey);
+                        tmpDoc.addField("base64_hash", hash);
+                        docs.add(tmpDoc);
+                        count++;
+                    }
                 }
                 tmp = te.next();
             }
@@ -176,6 +182,10 @@ public class EntropyData
         }
     }
 
+    static boolean isLive(Bits liveDocs, TermsEnum te) throws IOException {
+        DocsEnum de = te.docs(liveDocs, null);
+        return de.nextDoc() != DocIdSetIterator.NO_MORE_DOCS;
+    }
 
     static BytesRef decodeCont(String cont) {
         byte[] bytes = Base64.decodeBase64(cont);
