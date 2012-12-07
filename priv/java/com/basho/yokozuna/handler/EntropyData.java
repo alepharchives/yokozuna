@@ -152,7 +152,7 @@ public class EntropyData
                     SolrDocument tmpDoc = new SolrDocument();
                     tmpDoc.addField("riak_bucket", riakBucket);
                     tmpDoc.addField("riak_key", riakKey);
-                    tmpDoc.addField("base64_hash", Base64.encodeBase64String(sha(hash)));
+                    tmpDoc.addField("base64_hash", hash);
                     docs.add(tmpDoc);
                     count++;
                 }
@@ -184,12 +184,6 @@ public class EntropyData
 
     static boolean endOfItr(BytesRef returnValue) {
         return returnValue == null;
-    }
-
-    static byte[] sha(String s) throws NoSuchAlgorithmException {
-        MessageDigest md = MessageDigest.getInstance("SHA");
-        md.update(s.getBytes());
-        return md.digest();
     }
 
     static boolean isContinue(BytesRef cont) {

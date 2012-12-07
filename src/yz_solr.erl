@@ -270,7 +270,7 @@ get_pairs(R) ->
     [to_pair(DocStruct) || DocStruct <- Docs].
 
 to_pair({struct, [{_,Bucket},{_,Key},{_,Base64Hash}]}) ->
-    {{Bucket,Key}, Base64Hash}.
+    {{Bucket,Key}, base64:decode(Base64Hash)}.
 
 get_path({struct, PL}, Path) ->
     get_path(PL, Path);
