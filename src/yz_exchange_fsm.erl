@@ -199,7 +199,7 @@ exchange_segment_kv(Tree, IndexN, Segment) ->
     riak_kv_index_hashtree:exchange_segment(IndexN, Segment, Tree).
 
 %% @private
-read_repair_keydiff(RC, {remote_missing, KeyBin}) ->
+read_repair_keydiff(_RC, {remote_missing, _KeyBin}) ->
     %% In this case KV is missing the key but Yokozuna has it.
     %% Currently the Yokozuna entropy data may include keys that have
     %% been deleted.  This is becuse of how deletion works in
@@ -208,9 +208,9 @@ read_repair_keydiff(RC, {remote_missing, KeyBin}) ->
     %% anything.
     ok;
 
-read_repair_keydiff(RC, {_, KeyBin}) ->
+read_repair_keydiff(RC, {Reason, KeyBin}) ->
     BKey = {Bucket, Key} = binary_to_term(KeyBin),
-    lager:debug("Anti-entropy forced read repair and re-index: ~p/~p", [Bucket, Key]),
+    lager:debug("Anti-entropy forced read repair and re-index: ~p/~p (~p)", [Bucket, Key, Reason]),
     {ok, Obj} = RC:get(Bucket, Key),
     Ring = yz_misc:get_ring(transformed),
     BucketProps = riak_core_bucket:get_bucket(Bucket, Ring),
