@@ -50,8 +50,10 @@ make_doc(O, FPN, Partition) ->
 
 -spec extract_fields(obj()) ->  fields() | {error, any()}.
 extract_fields(O) ->
-    case yz_kv:is_tombstone(O) of
-        false ->
+    case {yz_kv:index_content(O), yz_kv:is_tombstone(O)} of
+        {false, _} ->
+            [];
+        {true, false} ->
             CT = yz_kv:get_obj_ct(O),
             Value = hd(riak_object:get_values(O)),
             ExtractorDef = yz_extractor:get_def(CT, [check_default]),
@@ -62,7 +64,7 @@ extract_fields(O) ->
                 Fields ->
                     Fields
             end;
-        true ->
+        {_, true} ->
             []
     end.
 
