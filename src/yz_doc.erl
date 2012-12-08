@@ -58,7 +58,11 @@ make_doc(O, {MD, V}, FPN, Partition) ->
     EntropyData = gen_ed(O, Partition),
     Fields = make_fields({DocId, yz_kv:get_obj_key(O), FPN,
                           Partition, Vtag, EntropyData}),
-    ExtractedFields = extract_fields({MD, V}),
+    ExtractedFields =
+        case yz_kv:index_content(O) of
+            true -> extract_fields({MD, V});
+            false -> []
+        end,
     Tags = extract_tags(MD),
     {doc, lists:append([Tags, ExtractedFields, Fields])}.
 
@@ -81,7 +85,7 @@ get_vtag(O, MD) ->
         _ -> none
     end.
 
-% -spec extract_fields(obj()) ->  fields() | {error, any()}.
+-spec extract_fields({obj_metadata(), term()}) ->  fields() | {error, any()}.
 extract_fields({MD, V}) ->
     case yz_kv:is_tombstone(MD) of
         false ->

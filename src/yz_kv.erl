@@ -80,6 +80,12 @@ get_obj_md(Obj) ->
 get_obj_value(Obj) ->
     riak_object:get_value(Obj).
 
+-spec index_content(obj()) -> boolean().
+index_content(O) ->
+    Bucket = yz_kv:get_obj_bucket(O),
+    BProps = riak_core_bucket:get_bucket(Bucket),
+    proplists:get_value(yz_index_content, BProps, false).
+
 %% @doc Determine if the `Obj' is a tombstone.
 -spec is_tombstone(obj_metadata()) -> boolean().
 is_tombstone(MD) ->
