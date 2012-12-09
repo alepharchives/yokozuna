@@ -153,16 +153,15 @@ index(Obj, Reason, VNodeState) ->
 %% @doc Install the object modified hook on the given `Bucket'.
 -spec install_hook(binary()) -> ok.
 install_hook(Bucket) when is_binary(Bucket) ->
-    Mod = yz_kv,
-    Fun = index,
-    ok = riak_kv_vnode:add_obj_modified_hook(Bucket, Mod, Fun).
+    set_index_flag(Bucket, true).
 
 %% @doc Uninstall the object modified hook on the given `Bucket'.
 -spec uninstall_hook(binary()) -> ok.
 uninstall_hook(Bucket) when is_binary(Bucket) ->
-    Mod = yz_kv,
-    Fun = index,
-    ok = remove_obj_modified_hook(Bucket, Mod, Fun).
+    set_index_flag(Bucket, false).
+
+set_index_flag(Bucket, Bool) ->
+    ok = riak_core_bucket:set_bucket(Bucket, [{yz_index_content, Bool}]).
 
 %% @doc Write a value
 -spec put(any(), binary(), binary(), binary(), string()) -> ok.
