@@ -200,10 +200,10 @@ exchange_segment_kv(Tree, IndexN, Segment) ->
 
 %% @private
 read_repair_keydiff(_RC, {remote_missing, KeyBin}) ->
-    %% In this case KV is missing the key but Yokozuna has it.
-    %% Something is wrong.
-    lager:warning("Anti-entropy detected indexes for an object which "
-                  "doesn't exist ~p", [KeyBin]),
+    %% Yokozuna has it but KV doesn't
+    {B,K} = binary_to_term(KeyBin),
+    yz_solr:delete_by_query(binary_to_list(B),
+                            yz_solr:build_rk_delete_query(K)),
     ok;
 
 read_repair_keydiff(RC, {Reason, KeyBin}) ->

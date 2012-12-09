@@ -44,6 +44,11 @@ build_partition_delete_query(LPartitions) ->
                || LP <- LPartitions],
     xmerl:export_simple([{delete, [], Queries}], xmerl_xml).
 
+-spec build_rk_delete_query(binary()) -> term().
+build_rk_delete_query(RiakKey) ->
+    Queries = [?QUERY(?YZ_RK_FIELD_S ++ ":" ++ binary_to_list(RiakKey))],
+    xmerl:export_simple([{delete, [], Queries}], xmerl_xml).
+
 commit(Core) ->
     BaseURL = base_url() ++ "/" ++ Core ++  "/update",
     XML = encode_commit(),
