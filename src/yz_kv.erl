@@ -106,7 +106,7 @@ get_md_entry(MD, Key) ->
 %% written or modified.
 %%
 %% NOTE: For a normal update this hook runs on the vnode process.
-%%       During active anti-entropy runs on spwned process.
+%%       During active anti-entropy runs on spawned process.
 %%
 %% NOTE: Index is doing double duty of index and delete.
 -spec index(obj(), write_reason(), term()) -> ok.
